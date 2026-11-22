@@ -1,8 +1,9 @@
-"""FastAPI for potato tuber visual quality + SQLite inspection history.
+"""Poptato FastAPI: ResNet50, SQLite, hardware HX711, and one-shot CNN commands.
 
-ResNet50 preprocessing matches the training notebook:
-RGB [0,255] -> BGR and ImageNet mean subtraction via preprocess_input.
-Sigmoid output: 1 = BAD.
+Run from API_ResNet50_Kentang directory:
+    python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+Prototype: single API worker + local trusted Wi-Fi only. Do not publish control routes.
 """
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
@@ -10,7 +11,9 @@ from io import BytesIO
 import os
 from pathlib import Path
 import sqlite3
+import threading
 import time
+from uuid import uuid4
 
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -22,6 +25,15 @@ DB_PATH = Path(os.getenv("DB_PATH", "potato_history.db"))
 MAX_FILE_BYTES = 10 * 1024 * 1024
 IMAGE_SIZE = (224, 224)
 model = None
+
+# One potato at a time. Command state is in memory (not durable on restart).
+command_lock = threading.Lock()
+perintah_sortir = None
+hardware_terakhir = None
+
+
+def now_iso():
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
 @contextmanager
@@ -58,7 +70,7 @@ def init_db():
 
 
 def save_inspection(filename: str, result: dict, response_ms: int):
-    created_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    created_at = now_iso()
     with get_connection() as conn:
         cur = conn.execute("""
             INSERT INTO inspections (
@@ -88,16 +100,16 @@ async def lifespan(app: FastAPI):
             raise RuntimeError(f"Output model tidak sesuai sigmoid biner: {model.output_shape}")
         print(f"Model ResNet50 dimuat dari {MODEL_PATH}")
     else:
-        print(f"PERINGATAN: model belum ada di {MODEL_PATH}; /predict dan /grade akan mengembalikan HTTP 503")
+        print(f"PERINGATAN: model belum ada di {MODEL_PATH}; /predict dan /grade HTTP 503")
     print(f"SQLite history: {DB_PATH.resolve()}")
     yield
     model = None
 
 
 app = FastAPI(
-    title="API Klasifikasi Kentang — ResNet50 + SQLite",
-    description="Good/Bad dari citra, penggolongan ukuran berdasarkan berat, dan riwayat pemeriksaan permanen di SQLite. Bukan sertifikasi mutu SNI.",
-    version="1.1.0", lifespan=lifespan,
+    title="API Klasifikasi Kentang — ResNet50 + SQLite + ESP32",
+    description="GOOD/BAD dari citra lalu timbang HX711 dan sortir fisik ESP32.",
+    version="2.0.0", lifespan=lifespan,
 )
 
 
@@ -120,9 +132,22 @@ class GradingResponse(PredictionResponse):
     keterangan: str
 
 
+class DataLoadCell(BaseModel):
+    berat_gram: float = Field(ge=0, allow_inf_nan=False)
+
+
+class PerintahSortir(BaseModel):
+    kondisi_visual: str
+
+
+class KonfirmasiPerintah(BaseModel):
+    id: str
+    berat_gram: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+
 def ensure_model():
     if model is None:
-        raise HTTPException(503, detail="Model belum dimuat. Letakkan resnet50_best.keras sesuai MODEL_PATH dan restart server.")
+        raise HTTPException(503, detail="Model belum dimuat. Periksa MODEL_PATH dan restart server.")
 
 
 async def read_photo(file: UploadFile) -> np.ndarray:
@@ -157,9 +182,9 @@ async def classify(file: UploadFile, threshold_bad: float) -> dict:
     is_bad = p_bad >= threshold_bad
     return {
         "kondisi_visual": "BAD" if is_bad else "GOOD",
-        "probabilitas_good": round(1.0 - p_bad, 6),
+        "probabilitas_good": round(1 - p_bad, 6),
         "probabilitas_bad": round(p_bad, 6),
-        "confidence": round(p_bad if is_bad else 1.0 - p_bad, 6),
+        "confidence": round(p_bad if is_bad else 1 - p_bad, 6),
         "threshold_bad": threshold_bad,
         "model": "ResNet50",
     }
@@ -175,6 +200,27 @@ def weight_group(grams: float) -> str:
     return "SANGAT BESAR"
 
 
+def assert_not_busy():
+    if perintah_sortir is not None and perintah_sortir["status"] in ("MENUNGGU_ESP32", "DIPROSES"):
+        raise HTTPException(409, detail="Masih ada kentang yang menunggu atau sedang diproses")
+
+
+def new_command(kondisi: str, record_id: int | None = None):
+    global perintah_sortir
+    if kondisi not in ("GOOD", "BAD"):
+        raise HTTPException(422, detail="Kondisi harus GOOD atau BAD")
+    # Caller MUST hold command_lock.
+    assert_not_busy()
+    perintah_sortir = {
+        "id": uuid4().hex,  # string ID: no precision loss in ArduinoJson
+        "kondisi_visual": kondisi,
+        "status": "MENUNGGU_ESP32",
+        "record_id": record_id,
+        "waktu": now_iso(),
+    }
+    return perintah_sortir.copy()
+
+
 @app.get("/health")
 def health():
     return {
@@ -188,25 +234,32 @@ def health():
 @app.post("/predict", response_model=PredictionResponse)
 async def predict(file: UploadFile = File(...), threshold_bad: float = Form(0.5)):
     started = time.perf_counter()
+    # This endpoint is the automatic physical sorting mode.
+    with command_lock:
+        assert_not_busy()
     result = await classify(file, threshold_bad)
     response_ms = round((time.perf_counter() - started) * 1000)
-    record_id, created_at = save_inspection(file.filename or "upload", result, response_ms)
+    with command_lock:
+        assert_not_busy()
+        record_id, created_at = save_inspection(file.filename or "upload", result, response_ms)
+        new_command(result["kondisi_visual"], record_id)
     return {**result, "record_id": record_id, "created_at": created_at, "response_ms": response_ms}
 
 
 @app.post("/grade", response_model=GradingResponse)
 async def grade(file: UploadFile = File(...), berat_gram: float = Form(..., gt=0), threshold_bad: float = Form(0.5)):
+    # Existing manual simulation remains separate from physical sorting commands.
     started = time.perf_counter()
     result = await classify(file, threshold_bad)
     if not np.isfinite(berat_gram):
-        raise HTTPException(422, detail="berat_gram harus angka hingga/finite.")
+        raise HTTPException(422, detail="berat_gram harus finite")
     if result["kondisi_visual"] == "BAD":
         result = {**result, "berat_gram": berat_gram, "keputusan_sortir": "REJECT", "golongan_ukuran": None,
-                  "keterangan": "Cacat visual menurut model; pada prototipe tidak dilanjutkan ke penggolongan ukuran."}
+                  "keterangan": "Cacat visual menurut model; tidak disortir berdasarkan ukuran."}
     else:
         group = weight_group(berat_gram)
         result = {**result, "berat_gram": berat_gram, "keputusan_sortir": "LANJUT SORTIR", "golongan_ukuran": group,
-                  "keterangan": "Golongan ukuran berdasarkan berat, bukan penetapan Mutu I/II SNI. Untuk berat pecahan gram digunakan batas kontinu."}
+                  "keterangan": "Golongan ukuran berdasarkan berat; bukan sertifikasi mutu SNI."}
     response_ms = round((time.perf_counter() - started) * 1000)
     record_id, created_at = save_inspection(file.filename or "upload", result, response_ms)
     return {**result, "record_id": record_id, "created_at": created_at, "response_ms": response_ms}
@@ -216,9 +269,7 @@ async def grade(file: UploadFile = File(...), berat_gram: float = Form(..., gt=0
 def list_records(limit: int = Query(500, ge=1, le=5000), offset: int = Query(0, ge=0)):
     with get_connection() as conn:
         total = conn.execute("SELECT COUNT(*) FROM inspections").fetchone()[0]
-        rows = conn.execute(
-            "SELECT * FROM inspections ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM inspections ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
     return {"total": total, "records": [dict(row) for row in rows]}
 
 
@@ -228,3 +279,77 @@ def clear_records():
         conn.execute("DELETE FROM inspections")
         conn.commit()
     return {"status": "cleared", "message": "Riwayat pemeriksaan berhasil dihapus."}
+
+
+@app.post("/hardware/berat")
+def terima_berat(data: DataLoadCell):
+    global hardware_terakhir
+    hardware_terakhir = {
+        "berat_gram": data.berat_gram,
+        "kategori": weight_group(data.berat_gram),
+        "waktu": now_iso(),
+    }
+    return {"status": "berhasil", "data": hardware_terakhir}
+
+
+@app.get("/hardware/berat")
+def lihat_berat():
+    return {"data": hardware_terakhir}
+
+
+@app.post("/hardware/perintah")
+def buat_perintah(data: PerintahSortir):
+    # Swagger manual test; /predict already creates these automatically.
+    with command_lock:
+        cmd = new_command(data.kondisi_visual.upper())
+    return {"status": "berhasil", "perintah": cmd}
+
+
+@app.get("/hardware/perintah")
+def ambil_perintah():
+    with command_lock:
+        cmd = perintah_sortir.copy() if perintah_sortir else None
+    return {"perintah": cmd}
+
+
+@app.post("/hardware/perintah/{command_id}/mulai")
+def mulai_perintah(command_id: str):
+    global perintah_sortir
+    with command_lock:
+        if perintah_sortir is None:
+            raise HTTPException(404, detail="Tidak ada perintah")
+        if perintah_sortir["id"] != command_id:
+            raise HTTPException(409, detail="ID perintah tidak sesuai")
+        if perintah_sortir["status"] != "MENUNGGU_ESP32":
+            raise HTTPException(409, detail="Perintah sudah diambil atau selesai")
+        perintah_sortir["status"] = "DIPROSES"
+        cmd = perintah_sortir.copy()
+    return {"status": "berhasil", "perintah": cmd}
+
+
+@app.post("/hardware/perintah/selesai")
+def selesaikan_perintah(data: KonfirmasiPerintah):
+    global perintah_sortir
+    with command_lock:
+        if perintah_sortir is None:
+            raise HTTPException(404, detail="Tidak ada perintah")
+        if perintah_sortir["id"] != data.id:
+            raise HTTPException(409, detail="ID perintah tidak sesuai")
+        if perintah_sortir["status"] != "DIPROSES":
+            raise HTTPException(409, detail="Perintah belum DIPROSES atau sudah selesai")
+        if data.berat_gram is None:
+            raise HTTPException(422, detail="berat_gram harus dikirim saat konfirmasi")
+        kondisi = perintah_sortir["kondisi_visual"]
+        record_id = perintah_sortir["record_id"]
+        keputusan = "REJECT" if kondisi == "BAD" else "LANJUT SORTIR"
+        golongan = None if kondisi == "BAD" else weight_group(data.berat_gram)
+        if record_id is not None:
+            with get_connection() as conn:
+                conn.execute("""UPDATE inspections SET berat_gram=?, keputusan_sortir=?, golongan_ukuran=? WHERE id=?""",
+                             (data.berat_gram, keputusan, golongan, record_id))
+                conn.commit()
+        perintah_sortir["status"] = "SELESAI"
+        perintah_sortir["berat_gram"] = data.berat_gram
+        perintah_sortir["selesai_pada"] = now_iso()
+        cmd = perintah_sortir.copy()
+    return {"status": "berhasil", "perintah": cmd}

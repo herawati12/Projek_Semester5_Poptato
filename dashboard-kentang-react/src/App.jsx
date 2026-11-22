@@ -170,6 +170,9 @@ export default function App(){
         <div className="heading-row"><div><div className="eyebrow"><span className="eyebrow-line"/> SMART SORTING SYSTEM</div><h1>Dashboard Sortasi Kentang<span className="title-dot">.</span></h1><p className="subtitle">Analisis kondisi visual kentang menggunakan AI, terintegrasi dengan sistem grading berat.</p></div><div className="date-chip"><Clock3 size={16}/>{new Date().toLocaleDateString('id-ID',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}</div></div>
         {historyError?<p className="inline-error">{historyError}</p>:null}
         <div className="metrics"><Metric icon={ScanLine} label="Total Pemeriksaan" value={history.length} note="Tersimpan di SQLite"/><Metric icon={CheckCircle2} label="Kentang Good" value={goodCount} note={history.length?`${format(100*goodCount/history.length)}% dari total`:'Belum ada pemeriksaan'}/><Metric icon={CircleAlert} label="Kentang Bad" value={badCount} note={history.length?`${format(100*badCount/history.length)}% dari total`:'Belum ada pemeriksaan'} tone="orange"/><Metric icon={Zap} label="Respons API Terakhir" value={lastLatency===null?'—':`${lastLatency} ms`} note="Termasuk transfer & inferensi" tone="blue"/></div>
+        
+        <HardwareMonitor />
+
         <div className="work-grid">
           <section className="card camera-card"><div className="card-heading"><div><div className="kicker">01 / IMAGE ACQUISITION</div><h2>Monitoring Kamera</h2><p>Ambil foto kentang melalui webcam atau unggah gambar.</p></div><Pill kind={cameraOn?'success':'neutral'}><span className={'statusdot '+(cameraOn?'green':'')}/>{cameraOn?'LIVE CAMERA':'CAMERA OFF'}</Pill></div>
             <div className="camera-input-options">
@@ -214,3 +217,83 @@ export default function App(){
   </div>
 }
 function HistoryTable({rows}){return <div className="table-scroll"><table><thead><tr><th>WAKTU</th><th>KONDISI</th><th>CONFIDENCE</th><th>BERAT</th><th>UKURAN</th><th>RESPONS</th></tr></thead><tbody>{rows.length?rows.map(row=><tr key={row.id}><td className="time-col"><Clock3 size={14}/>{row.time}</td><td><Pill kind={row.label==='GOOD'?'success':'danger'}><span className="statusdot"/>{row.label}</Pill></td><td>{format(row.confidence*100,2)}%</td><td>{row.weight===null?'—':`${format(row.weight)} g`}</td><td>{row.group||'—'}</td><td>{row.ms} ms</td></tr>):<tr><td colSpan="6" className="empty-table"><Layers3 size={24}/><span>Belum ada pemeriksaan pada sesi ini.</span></td></tr>}</tbody></table></div>}
+
+
+function HardwareMonitor() {
+  const [hardware, setHardware] = useState(null)
+  const [errorHardware, setErrorHardware] = useState('')
+
+  useEffect(() => {
+    let aktif = true
+
+    async function ambilBerat() {
+      try {
+        const response = await fetch(
+          `${BASE}/hardware/berat`
+        )
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`)
+        }
+
+        const hasil = await response.json()
+
+        if (aktif) {
+          setHardware(hasil.data)
+          setErrorHardware('')
+        }
+      } catch (error) {
+        if (aktif) {
+          setErrorHardware('Data hardware belum tersedia')
+        }
+      }
+    }
+
+    ambilBerat()
+
+    const interval = setInterval(ambilBerat, 2000)
+
+    return () => {
+      aktif = false
+      clearInterval(interval)
+    }
+  }, [])
+
+  return (
+    <section className="card" style={{padding: 24}}>
+      <div className="kicker">
+        HARDWARE MONITORING
+      </div>
+
+      <h2>Monitoring Load Cell HX711</h2>
+
+      {hardware ? (
+        <>
+          <h1>
+            {format(hardware.berat_gram, 2)} gram
+          </h1>
+
+          <p>
+            Kategori: <strong>{hardware.kategori}</strong>
+          </p>
+
+          <p>
+            Pembaruan terakhir:
+            {' '}
+            {new Date(hardware.waktu)
+              .toLocaleString('id-ID')}
+          </p>
+        </>
+      ) : (
+        <p>Menunggu data dari ESP32...</p>
+      )}
+
+      {errorHardware && (
+        <p className="inline-error">
+          {errorHardware}
+        </p>
+      )}
+    </section>
+  )
+}
+
